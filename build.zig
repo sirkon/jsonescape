@@ -4,7 +4,7 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const mod = b.addModule("json_escape", .{
+    const mod = b.addModule("jsonescape", .{
         .root_source_file = b.path("src/json_escape.zig"),
         .target = target,
         .optimize = optimize,
