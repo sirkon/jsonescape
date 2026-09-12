@@ -1,0 +1,7 @@
+.{
+    .name = .jsonescape,
+    .version = "0.0.1",
+    .minimum_zig_version = "0.16.0",
+    .paths = .{""},
+    .fingerprint = 0xaa09975d301c3402,
+}
