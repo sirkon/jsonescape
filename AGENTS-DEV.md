@@ -5,8 +5,8 @@ into a single Zig module.
 
 ## Toolchain
 
-- **Zig 0.16.0** is required (`build.zig.zon` sets `minimum_zig_version = "0.16.0"`; the
-  installed `zig` is 0.16.0). Many APIs used here differ from older Zig the model may have
+- **Zig 0.17.0** is required (`build.zig.zon` sets `minimum_zig_version = "0.17.0"`; the
+  installed `zig` is 0.17.0). Many APIs used here differ from older Zig the model may have
   seen: `std.once` does not exist, `std.Target.current` does not exist, and
   `Cpu.features.isEnabled(.enum_tag)` is wrong (use `cpu.has(.x86, .avx2)`).
 

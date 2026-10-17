@@ -107,7 +107,7 @@ pub fn activeBackend() Backend {
 pub const EscapeEntry = struct { len: u8, bytes: [8]u8 };
 
 fn pad8(comptime s: []const u8) [8]u8 {
-    var out: [8]u8 = [_]u8{0} ** 8;
+    var out: [8]u8 = @splat(0);
     for (s, 0..) |c, i| out[i] = c;
     return out;
 }
@@ -160,7 +160,7 @@ pub fn Mask(comptime LANES: usize) type {
             return .{ .data = self.data | rhs.data };
         }
 
-        pub inline fn bitmask(self: Self) std.meta.Int(.unsigned, LANES) {
+        pub inline fn bitmask(self: Self) @Int(.unsigned, LANES) {
             return @bitCast(self.data);
         }
     };
@@ -170,7 +170,7 @@ pub fn SimdVector(comptime LANES: usize) type {
     return struct {
         const Self = @This();
         pub const lanes = LANES;
-        pub const BitMask = std.meta.Int(.unsigned, LANES);
+        pub const BitMask = @Int(.unsigned, LANES);
 
         data: @Vector(LANES, u8),
 
@@ -377,9 +377,9 @@ pub fn formatRaw(comptime Vec: type, value: []const u8, dst: [*]u8) [*]u8 {
     // Tier 3: tail loop. A full-LANES load may over-read up to LANES - 1 bytes;
     // that is only allowed on linux/macos in release modes and only when the
     // read stays within the current page.
-    var placeholder: [LANES]u8 = [_]u8{0} ** LANES;
+    var placeholder: [LANES]u8 = @splat(0);
     const direct_tail_load = comptime (builtin.os.tag == .linux or builtin.os.tag == .macos) and
-        (builtin.mode == .ReleaseFast or builtin.mode == .ReleaseSmall);
+        (builtin.mode == .fast or builtin.mode == .small);
 
     tail: while (nb > 0) {
         const v = if (direct_tail_load and !checkCrossPage(sptr, LANES))
@@ -449,7 +449,7 @@ pub fn escapeIntoUnquote(dst: [*]u8, value: []const u8) [*]u8 {
 /// Slice-typed convenience wrapper around `escapeInto` that checks capacity in
 /// Debug/ReleaseSafe and returns exactly the written bytes.
 pub fn escapeIntoSlice(dst: []u8, value: []const u8) []u8 {
-    if (comptime (builtin.mode == .Debug or builtin.mode == .ReleaseSafe)) {
+    if (comptime (builtin.mode == .debug or builtin.mode == .safe)) {
         if (dst.len < value.len * 6 + 64) @panic("destination buffer too small");
     }
     const end = escapeInto(dst.ptr, value);
@@ -458,7 +458,7 @@ pub fn escapeIntoSlice(dst: []u8, value: []const u8) []u8 {
 
 /// Slice-typed convenience wrapper around `escapeIntoUnquote`.
 pub fn escapeIntoUnquoteSlice(dst: []u8, value: []const u8) []u8 {
-    if (comptime (builtin.mode == .Debug or builtin.mode == .ReleaseSafe)) {
+    if (comptime (builtin.mode == .debug or builtin.mode == .safe)) {
         if (dst.len < value.len * 6 + 64) @panic("destination buffer too small");
     }
     const end = escapeIntoUnquote(dst.ptr, value);
@@ -568,7 +568,7 @@ test "quote table hand-checked" {
     try std.testing.expectEqual(@as(u8, 0), quoteTab[0x7F].len);
     try std.testing.expectEqual(@as(u8, 0), quoteTab[0xFF].len);
 
-    const all_zero: [8]u8 = [_]u8{0} ** 8;
+    const all_zero: [8]u8 = @splat(0);
     try std.testing.expectEqualSlices(u8, &all_zero, &quoteTab[0x7F].bytes);
 
     for (0..256) |i| {
@@ -585,7 +585,7 @@ test "bitmask type identity" {
 }
 
 test "escapedMask lane order" {
-    var buf: [64]u8 = [_]u8{'a'} ** 64;
+    var buf: [64]u8 = @splat('a');
     buf[0] = '"';
     buf[15] = '\\';
     buf[31] = 0x01;
@@ -644,13 +644,13 @@ test "special fixtures" {
     try expectMatchesOracle(&all_bytes, true);
     try expectMatchesOracle(&all_bytes, false);
 
-    var nuls: [200]u8 = [_]u8{0} ** 200;
+    var nuls: [200]u8 = @splat(0);
     try expectMatchesOracle(&nuls, true);
 
-    var quotes: [129]u8 = [_]u8{'"'} ** 129;
+    var quotes: [129]u8 = @splat('"');
     try expectMatchesOracle(&quotes, true);
 
-    var slashes: [130]u8 = [_]u8{'\\'} ** 130;
+    var slashes: [130]u8 = @splat('\\');
     try expectMatchesOracle(&slashes, true);
 }
 

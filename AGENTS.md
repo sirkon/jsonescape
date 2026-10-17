@@ -1,6 +1,6 @@
 # json_escape public API
 
-`json_escape` is a single-module Zig 0.16 library (`build.zig` declares an
+`json_escape` is a single-module Zig 0.17 library (`build.zig` declares an
 `addModule("json_escape", ...)` rooted at `src/json_escape.zig`). Import it as:
 
 ```zig
