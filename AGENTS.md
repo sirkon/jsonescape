@@ -96,7 +96,8 @@ These are `pub` so tests and custom kernels can use them; treat them as unstable
   runtime CPUID check that may downgrade to `.swar`).
 - `VectorFor(backend)` maps a backend to its vector type; `Mask(LANES)`,
   `SimdVector(LANES)`, and `FallbackVector` are the backend implementations, each
-  offering `loadu`, `storeu`, and `escapedMask`.
+  offering `loadu`, `storeu`, and `escapedMask`, plus `hotMask`/`hotMask4` returning the
+  kernel-internal `EscapeMask(LANES)` (one bit per lane, except the aarch64 nibble layout).
 - `EscapeEntry`, `quoteTab: [256]EscapeEntry`, and `needEscaped: [256]u8`.
 - `formatRaw(Vec, value, dst)`, `formatString(Vec, value, dst)`, and
   `formatUnquoted(Vec, value, dst)` are the per-backend kernels behind the dispatched

@@ -106,8 +106,16 @@ fn detectBackend() Backend {
 }
 
 pub inline fn activeBackend() Backend {
-    if (!backend_detected) return @call(.never_inline, detectBackend, .{});
-    return cached_backend;
+    switch (builtin.cpu.arch) {
+        // Only x86 has a runtime probe that can disagree with the compile-time
+        // candidate; elsewhere this folds away and saves a load and branch in
+        // every `escapeInto*` call.
+        .x86_64, .x86 => {
+            if (!backend_detected) return @call(.never_inline, detectBackend, .{});
+            return cached_backend;
+        },
+        else => return selected_backend,
+    }
 }
 
 pub const EscapeEntry = struct { len: u8, bytes: [8]u8 };
@@ -172,11 +180,74 @@ pub fn Mask(comptime LANES: usize) type {
     };
 }
 
+/// Escape mask as used by the kernels. It packs one bit per lane everywhere
+/// except on aarch64 with 16 lanes, where it uses the NEON nibble layout (4
+/// bits per lane). LLVM lowers `@bitCast(@Vector(16, bool))` to
+/// `and/ext/zip1/addv`; the nibble form is a single `shrn` and keeps the wider
+/// mask through `firstOffset` (`@ctz >> 2`), which is what the escape path
+/// needs. `escapedMask()` still exposes the portable one-bit-per-lane mask for
+/// tests and callers.
+pub fn EscapeMask(comptime LANES: usize) type {
+    return struct {
+        const Self = @This();
+        pub const lanes = LANES;
+        pub const nibble = builtin.cpu.arch == .aarch64 and LANES == 16;
+        pub const Bits = if (nibble) u64 else @Int(.unsigned, LANES);
+
+        bits: Bits,
+
+        pub inline fn orWith(self: Self, rhs: Self) Self {
+            return .{ .bits = self.bits | rhs.bits };
+        }
+
+        pub inline fn isZero(self: Self) bool {
+            return self.bits == 0;
+        }
+
+        pub inline fn firstOffset(self: Self) usize {
+            const trailing: usize = @ctz(self.bits);
+            return if (comptime nibble) trailing >> 2 else trailing;
+        }
+
+        /// Keeps the low `n` lanes and clears everything above them.
+        pub inline fn keepLanes(self: Self, n: usize) Self {
+            const drop = LANES - n;
+            if (comptime nibble) {
+                if (drop == 0) return self;
+                const shift: u6 = @intCast(drop * 4);
+                return .{ .bits = (self.bits << shift) >> shift };
+            }
+            const all_ones: Bits = std.math.maxInt(Bits);
+            return .{ .bits = self.bits & (all_ones >> @intCast(drop)) };
+        }
+
+        pub inline fn fromPredicate(pred: @Vector(LANES, bool)) Self {
+            if (comptime nibble) {
+                const V = @Vector(LANES, u8);
+                const bytes: V = @select(u8, pred, @as(V, @splat(0xFF)), @as(V, @splat(0x00)));
+                const wide: @Vector(LANES / 2, u16) = @bitCast(bytes);
+                const nibs: @Vector(LANES / 2, u16) = wide >> @as(@Vector(LANES / 2, u4), @splat(4));
+                const shrunk: V = @bitCast(nibs);
+                const even: @Vector(LANES / 2, u8) = @shuffle(u8, shrunk, undefined, even_lanes);
+                return .{ .bits = @bitCast(even) };
+            }
+            return .{ .bits = @bitCast(pred) };
+        }
+
+        const even_lanes: @Vector(LANES / 2, i32) = blk: {
+            var idx: [LANES / 2]i32 = undefined;
+            for (&idx, 0..) |*p, i| p.* = @intCast(2 * i);
+            break :blk idx;
+        };
+    };
+}
+
 pub fn SimdVector(comptime LANES: usize) type {
     return struct {
         const Self = @This();
         pub const lanes = LANES;
         pub const BitMask = @Int(.unsigned, LANES);
+        pub const HotMask = EscapeMask(LANES);
 
         data: @Vector(LANES, u8),
 
@@ -201,10 +272,25 @@ pub fn SimdVector(comptime LANES: usize) type {
         }
 
         pub inline fn escapedMask(self: Self) BitMask {
+            return self.predicate().bitmask();
+        }
+
+        /// Escape predicate in the vector domain, so multiple vectors can be
+        /// OR-ed before a single extraction to a bitmask.
+        pub inline fn predicate(self: Self) Mask(LANES) {
             const ctl = Self.splat(0x1F);
             const bslash = Self.splat('\\');
             const quote = Self.splat('"');
-            return self.le(ctl).orWith(self.eq(bslash)).orWith(self.eq(quote)).bitmask();
+            return self.le(ctl).orWith(self.eq(bslash)).orWith(self.eq(quote));
+        }
+
+        pub inline fn hotMask(self: Self) HotMask {
+            return HotMask.fromPredicate(self.predicate().data);
+        }
+
+        pub inline fn hotMask4(a: Self, b: Self, c: Self, d: Self) HotMask {
+            const or4 = a.predicate().orWith(b.predicate()).orWith(c.predicate()).orWith(d.predicate());
+            return HotMask.fromPredicate(or4.data);
         }
     };
 }
@@ -215,6 +301,7 @@ pub fn SimdVector(comptime LANES: usize) type {
 pub const FallbackVector = struct {
     pub const lanes = 64;
     pub const BitMask = u64;
+    pub const HotMask = EscapeMask(64);
 
     const native_endian = builtin.cpu.arch.endian();
 
@@ -254,6 +341,7 @@ pub const FallbackVector = struct {
     }
 
     pub inline fn escapedMask(self: FallbackVector) u64 {
+        @setEvalBranchQuota(10_000);
         var bm: u64 = 0;
         inline for (0..8) |wi| {
             const w = self.words[wi];
@@ -267,18 +355,15 @@ pub const FallbackVector = struct {
         }
         return bm;
     }
+
+    pub inline fn hotMask(self: FallbackVector) HotMask {
+        return .{ .bits = self.escapedMask() };
+    }
+
+    pub inline fn hotMask4(a: FallbackVector, b: FallbackVector, c: FallbackVector, d: FallbackVector) HotMask {
+        return .{ .bits = a.escapedMask() | b.escapedMask() | c.escapedMask() | d.escapedMask() };
+    }
 };
-
-inline fn firstOffset(m: anytype) usize {
-    return @ctz(m);
-}
-
-inline fn clearHighBits(m: anytype, n: usize) @TypeOf(m) {
-    const T = @TypeOf(m);
-    const all_ones: T = std.math.maxInt(T);
-    std.debug.assert(n < @bitSizeOf(T));
-    return m & (all_ones >> @intCast(n));
-}
 
 pub fn VectorFor(comptime b: Backend) type {
     return switch (b) {
@@ -331,12 +416,7 @@ pub fn formatRaw(comptime Vec: type, value: []const u8, dst: [*]u8) [*]u8 {
         const v3 = Vec.loadu(sptr + LANES * 2);
         const v4 = Vec.loadu(sptr + LANES * 3);
 
-        const m1 = v1.escapedMask();
-        const m2 = v2.escapedMask();
-        const m3 = v3.escapedMask();
-        const m4 = v4.escapedMask();
-
-        if ((m1 | m2 | m3 | m4) == 0) {
+        if (Vec.hotMask4(v1, v2, v3, v4).isZero()) {
             v1.storeu(dptr);
             v2.storeu(dptr + LANES);
             v3.storeu(dptr + LANES * 2);
@@ -345,10 +425,11 @@ pub fn formatRaw(comptime Vec: type, value: []const u8, dst: [*]u8) [*]u8 {
             dptr += CHUNK;
             sptr += CHUNK;
         } else {
-            inline for (.{ v1, v2, v3, v4 }, .{ m1, m2, m3, m4 }) |v, m| {
+            inline for (.{ v1, v2, v3, v4 }) |v| {
                 v.storeu(dptr);
-                if (m != 0) {
-                    const cn = firstOffset(m);
+                const m = v.hotMask();
+                if (!m.isZero()) {
+                    const cn = m.firstOffset();
                     nb -= cn;
                     dptr += cn;
                     sptr += cn;
@@ -366,13 +447,13 @@ pub fn formatRaw(comptime Vec: type, value: []const u8, dst: [*]u8) [*]u8 {
     while (nb >= LANES) {
         const v = Vec.loadu(sptr);
         v.storeu(dptr);
-        const m = v.escapedMask();
-        if (m == 0) {
+        const m = v.hotMask();
+        if (m.isZero()) {
             nb -= LANES;
             dptr += LANES;
             sptr += LANES;
         } else {
-            const cn = firstOffset(m);
+            const cn = m.firstOffset();
             nb -= cn;
             dptr += cn;
             sptr += cn;
@@ -383,7 +464,7 @@ pub fn formatRaw(comptime Vec: type, value: []const u8, dst: [*]u8) [*]u8 {
     // Tier 3: tail loop. A full-LANES load may over-read up to LANES - 1 bytes;
     // that is only allowed on linux/macos in release modes and only when the
     // read stays within the current page.
-    var placeholder: [LANES]u8 = @splat(0);
+    var placeholder: [LANES]u8 = undefined;
     const direct_tail_load = comptime (builtin.os.tag == .linux or builtin.os.tag == .macos) and
         (builtin.mode == .fast or builtin.mode == .small);
 
@@ -396,17 +477,21 @@ pub fn formatRaw(comptime Vec: type, value: []const u8, dst: [*]u8) [*]u8 {
         };
 
         v.storeu(dptr);
-        const m = clearHighBits(v.escapedMask(), LANES - nb);
-        if (m == 0) {
+        // Lanes past `nb` may hold over-read bytes, but they can only move the
+        // first escape at or beyond `nb`, so a first offset >= nb means the
+        // valid range is clean. The NEON nibble mask uses that directly (the
+        // mask shift would cost more than the compare); the one-bit-per-lane
+        // masks are cheaper to clear, which keeps `@ctz` off the branch.
+        const m = if (comptime Vec.HotMask.nibble) v.hotMask() else v.hotMask().keepLanes(nb);
+        const cn = m.firstOffset();
+        if (cn >= nb) {
             dptr += nb;
             break :tail;
-        } else {
-            const cn = firstOffset(m);
-            nb -= cn;
-            dptr += cn;
-            sptr += cn;
-            escapeUnchecked(&sptr, &nb, &dptr);
         }
+        nb -= cn;
+        dptr += cn;
+        sptr += cn;
+        escapeUnchecked(&sptr, &nb, &dptr);
     }
 
     return dptr;
@@ -627,6 +712,32 @@ test "escapedMask lane order" {
 
     const vswar = FallbackVector.loadu(&buf);
     try std.testing.expectEqual(v64.escapedMask(), vswar.escapedMask());
+}
+
+test "packed mask agrees with the portable bitmask" {
+    var buf: [256]u8 = undefined;
+    for (&buf, 0..) |*b, i| b.* = @intCast('a' + i % 26);
+
+    for (0..64) |pos| {
+        buf[pos] = '"';
+        inline for (all_backends) |Vec| {
+            const m = Vec.loadu(&buf).escapedMask();
+            const h = Vec.loadu(&buf).hotMask();
+            try std.testing.expectEqual(m == 0, h.isZero());
+            try std.testing.expectEqual(@ctz(m), h.firstOffset());
+
+            // The 4x-wide loop ORs the predicates of four vectors before a
+            // single extraction; that must match OR-ing the masks themselves.
+            const a = Vec.loadu(&buf);
+            const b = Vec.loadu(buf[pos..].ptr);
+            const c = Vec.loadu(buf[pos + 1 ..].ptr);
+            const d = Vec.loadu(buf[pos + 2 ..].ptr);
+            const combined = Vec.hotMask4(a, b, c, d);
+            const expected = a.hotMask().orWith(b.hotMask()).orWith(c.hotMask()).orWith(d.hotMask());
+            try std.testing.expectEqual(expected.bits, combined.bits);
+        }
+        buf[pos] = 'z';
+    }
 }
 
 fn nextRand(s: *u64) u8 {

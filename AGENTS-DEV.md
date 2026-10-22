@@ -61,7 +61,9 @@ Control flow: public API -> `activeBackend()` runtime dispatch -> `VectorFor(bac
 - `selectBackend()` picks a **comptime candidate** from `builtin.cpu`.
 - `activeBackend()` caches a **runtime** CPUID/XGETBV check (x86 only) that may downgrade the
   candidate to `.swar`. State is a module-level `var` + bool guard, not `std.once`. The probe
-  itself is the out-of-line `detectBackend`, so the hot path is a load and a branch.
+  itself is the out-of-line `detectBackend`, so the hot path is a load and a branch. On
+  non-x86 targets the guard is compile-time-eliminated and `activeBackend()` folds to
+  `selected_backend` (the `switch` on `builtin.cpu.arch` must stay so this keeps working).
 - The four tiers map to LANES: `sse2`/`neon` -> 16, `avx2` -> 32, `avx512` -> 64,
   `swar` -> `FallbackVector` (64 bytes as eight `u64` SWAR words).
 - `formatRaw` has three tiers: a 4x-wide `CHUNK` loop, a single-vector loop, and a scalar
@@ -69,7 +71,14 @@ Control flow: public API -> `activeBackend()` runtime dispatch -> `VectorFor(bac
   ReleaseFast/ReleaseSmall + same 4 KiB page). See section 4.3 of the blueprint.
 - Rust needed five per-arch backends because of `#[target_feature]`; Zig's
   `@Vector(N, u8)` lowers per compile target instead, so there is exactly one generic
-  pipeline. Do not recreate the per-arch files or the `NeonBits` movemask hack.
+  pipeline. Do not recreate the per-arch files.
+- `EscapeMask(LANES)` is the kernel-internal escape mask. It is one bit per lane except on
+  aarch64/16 lanes, where it stores the NEON nibble layout (4 bits per lane, one `shrn` to
+  extract, `firstOffset` = `@ctz >> 2`). LLVM lowers `@bitCast(@Vector(16, bool))` to
+  `and/ext/zip1/addv`, which cost the port 10-30% vs the Rust crate on M1; the nibble mask
+  is the same trick as Rust's `NeonBits`. `escapedMask()`/`Mask.bitmask()` keep the portable
+  one-bit-per-lane contract for tests and callers. Do not collapse the two.
+- Tier 1 ORs the four predicates in the vector domain (`Vec.hotMask4`) and extracts once.
 
 ## Public API contract (important gotchas)
 
@@ -98,9 +107,13 @@ Control flow: public API -> `activeBackend()` runtime dispatch -> `VectorFor(bac
   natural alignment and is UB on unaligned input.
 - No implicit integer casts. Shift counts must be the operand's shift type, so runtime
   shifts use `x >> @intCast(n)` after materializing a typed `all_ones` (a `comptime_int`
-  cannot be shifted by a runtime amount). See `clearHighBits`.
+  cannot be shifted by a runtime amount). See `EscapeMask.keepLanes`.
 - `escapedMask` semantics: bit `i` of the result is 1 iff byte `i` needs escaping. Lane 0 is
-  bit 0, matching `@ctz` used by `firstOffset`.
+  bit 0, matching `@ctz` used by `EscapeMask.firstOffset`. The `EscapeMask` nibble layout
+  keeps the same `firstOffset` contract; only `bits` is arch-specific.
+- The tail loop rejects a first offset `>= nb` instead of masking lanes past `nb` on NEON
+  (cheaper), but masks on other backends (keeps `@ctz` off the branch, ~3% on x86
+  `short/every`).
 - Keep the small vector/mask methods `inline fn`; that is intentional for loop fusion.
 - Public API names are camelCase (`escapeIntoUnquote`), the Rust originals being snake_case.
 - **Keep the runtime dispatch out of the kernel's entry path.** `escapeInto` /

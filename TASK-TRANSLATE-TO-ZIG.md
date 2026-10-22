@@ -80,11 +80,19 @@ Rust needs five parallel files because `std::arch` intrinsics are per-arch and `
 is per-function. Zig's `@Vector(N, u8)` lowers to the best available register class for the
 *compile target*: SSE2/NEON for 16 lanes, AVX2 for 32, AVX-512 for 64 — and on any target it
 compiles whatever the target CPU supports. Therefore: **write `SimdVector(comptime LANES)`
-once, instantiate it at 16/32/64.** The only target-specific Rust artifact that does NOT
-translate is `bits.rs::NeonBits` (the 4-bits-per-lane NEON movemask hack):
-`@bitCast(@Vector(N, bool) → std.meta.Int(.unsigned, N))` guarantees lane *i* → bit *i* on
-every architecture; Zig emits the optimal lowering (on NEON it emits the shift-and-narrow
-sequence internally). Do not reimplement `NeonBits`.
+once, instantiate it at 16/32/64.**
+
+**Updated after measurement on Apple M1.** The original text here claimed `@bitCast` of a bool
+vector emits the shift-and-narrow sequence on NEON, making `bits.rs::NeonBits` obsolete. That
+is false for `<16 x i1> -> i16` as LLVM actually lowers it: for an OR of comparisons it emits
+`and.16b / ext.16b / zip1.16b / addv.8h` (plus a constant load), 5 instructions and ~10 cycles,
+versus Rust's single `shrn.8b`. That cost landed on every escape-path mask extraction and every
+tail-loop iteration, and made the port 10-30% slower than the Rust crate on M1. The fix is
+`EscapeMask(LANES)` (see 2.2): one-bit-per-lane masks everywhere except aarch64/16 lanes, where
+the kernel-internal mask is the NEON nibble layout (4 bits per lane, extracted with `shrn`,
+`firstOffset` = `@ctz >> 2`). The lane->bit contract of the public `escapedMask()` /
+`bitmask()` API is unchanged; only the kernel's internal representation is arch-specialized.
+Do not "simplify" this back to a single `@bitCast` mask.
 
 ### 0.3 File layout
 
@@ -314,7 +322,9 @@ Rules:
 Rust's `Simd`/`Mask`/`BitMask` trait stack becomes two comptime-generic structs. The mask
 type is `@Vector(LANES, bool)` and the bitmask integer is
 `std.meta.Int(.unsigned, LANES)` — which IS `u16` at 16 lanes, `u32` at 32, `u64` at 64, on
-every architecture (no per-arch special casing, no `NeonBits`).
+every architecture. That remains the public/test-facing contract (`Mask.bitmask`,
+`SimdVector.escapedMask`); the kernels additionally use `EscapeMask`, the arch-specialized
+packed form described in 0.2 and 2.2.
 
 ### 2.1 The generic vector (verified, copy verbatim)
 
@@ -406,6 +416,12 @@ inline fn clearHighBits(m: anytype, n: usize) @TypeOf(m) {
 - `n` must be runtime-`usize`; the `all_ones` materialization + `@intCast` is the ONLY
   correct shift form (ground rule 0.1.2).
 
+**Update: both helpers moved into `EscapeMask(LANES)`** (`firstOffset`, `keepLanes`,
+`isZero`, `orWith`, `fromPredicate`). `keepLanes(n)` replaces
+`clearHighBits(mask, LANES - n)`. The free functions were removed so the kernel has exactly
+one mask abstraction; the tail loop additionally skips the masking entirely on aarch64 (see
+4.3), where `firstOffset()` alone decides whether the valid range is clean.
+
 ### 2.3 Scalar fallback: `FallbackVector` (SWAR over `[8]u64`, LANES = 64) — verified
 
 Pure u64 SWAR, no SIMD registers. Layout: one `FallbackVector` covers 64 bytes as **eight
@@ -491,7 +507,8 @@ Rules / derivations (so the implementing agent doesn't "simplify" them wrongly):
 
 ### 2.4 What NOT to port
 
-- `bits.rs::NeonBits` — obsolete (see 0.2).
+- `bits.rs::NeonBits` — folded into `EscapeMask` as the aarch64/16-lane case (see 0.2). Do
+  not reintroduce it as a separate type or as the public bitmask type.
 - `BitOrAssign`/`BitAnd` trait impls — the algorithm needs only `|` on masks, which Zig
   gives natively on bool vectors.
 - `#[repr(transparent)]` newtypes — unnecessary; Zig struct-of-one-vector is already
@@ -565,19 +582,24 @@ with `const LANES = Vec.lanes;` and `const CHUNK = LANES * 4;`. `Vec` is any of
 ### 4.1 Tier 1 — CHUNK loop (`while (nb >= CHUNK)`)
 
 Load 4 vectors at `sptr`, `sptr + LANES`, `sptr + 2*LANES`, `sptr + 3*LANES`; compute the four
-escaped masks. Fast path: if `(m1 | m2 | m3 | m4) == 0` (integer OR of bitmasks — the types
-are identical since all come from the same `Vec`), store the 4 vectors to
-`dptr + i*LANES` and advance both cursors by CHUNK, decrement `nb` by CHUNK.
+escaped predicates. Fast path: if they are all empty, store the 4 vectors to `dptr + i*LANES`
+and advance both cursors by CHUNK, decrement `nb` by CHUNK.
+
+**Update:** the masks are no longer combined as integers in the source. `Vec.hotMask4(v1, v2,
+v3, v4)` ORs the four predicates in the vector domain and extracts once (`shrn` on NEON,
+`vpmovmskb` on x86) — combining the already-extracted integers forces four extractions on
+NEON. The slow path then re-extracts each vector's mask lazily with `v.hotMask()`.
 
 Slow path — process each vector in order; this is the verified structure using a labeled
 `continue` with `inline for` over tuples (replaces the four copy-pasted Rust blocks):
 
 ```zig
         } else {
-            inline for (.{ v1, v2, v3, v4 }, .{ m1, m2, m3, m4 }) |v, m| {
+            inline for (.{ v1, v2, v3, v4 }) |v| {
                 v.storeu(dptr);
-                if (m != 0) {
-                    const cn = firstOffset(m);
+                const m = v.hotMask();
+                if (!m.isZero()) {
+                    const cn = m.firstOffset();
                     nb -= cn;
                     dptr += cn;
                     sptr += cn;
@@ -657,6 +679,30 @@ runtime page check:
     return dptr;
 ```
 
+**Update (Apple Silicon, measured).** The loop above is the historical shape. The current
+kernel declares `placeholder` as `undefined` (Debug/ReleaseSafe fill exactly `nb` bytes before
+the load; lanes above `nb` are never trusted) and uses the mask helpers directly:
+
+```zig
+        v.storeu(dptr);
+        const m = if (comptime Vec.HotMask.nibble) v.hotMask() else v.hotMask().keepLanes(nb);
+        const cn = m.firstOffset();
+        if (cn >= nb) {
+            dptr += nb;
+            break :tail;
+        }
+        nb -= cn;
+        dptr += cn;
+        sptr += cn;
+        escapeUnchecked(&sptr, &nb, &dptr);
+```
+
+Why: on NEON the nibble mask is cheap to read but costs two shifts to clear, and `@ctz` already
+returns `LANES` for an empty mask, so comparing the first offset against `nb` is enough — the
+over-read lanes can only move the first escape at or beyond `nb`. On x86 clearing the mask is a
+single `bzhi`/`and`, and keeping `@ctz` off the branch dependency chain measures ~3% faster on
+`short/every`, so those masks still take the mask-then-test route.
+
 The exact cfg matrix (translating `#[cfg(...)]` in `avx2.rs:245-268`):
 
 | Condition (comptime or runtime) | Load source |
@@ -680,14 +726,14 @@ inline fn checkCrossPage(ptr: [*]const u8, step: usize) bool {
 
 Tail-loop invariants to preserve verbatim:
 - Store the full vector even though only `nb` bytes are meaningful — the capacity contract
-  (Part 5) guarantees `LANES` writable bytes at `dptr`. Then mask with
-  `clearHighBits(..., LANES - nb)` so garbage/zero lanes can't trigger false escapes.
-- All-zero mask → advance `dptr += nb` (not LANES!) and `break :tail`.
-- Otherwise `cn` from the masked mask, advance by `cn`, `escapeUnchecked`, loop. The loop
+  (Part 5) guarantees `LANES` writable bytes at `dptr`. Lanes at index >= `nb` must never
+  trigger an escape: either clear them (`keepLanes`) or reject a first offset >= `nb`.
+- No escape in the valid range → advance `dptr += nb` (not LANES!) and `break :tail`.
+- Otherwise `cn` from the mask, advance by `cn`, `escapeUnchecked`, loop. The loop
   re-runs only while `nb > 0`; `escapeUnchecked` can bring `nb` to 0, ending the loop.
-- The placeholder is declared OUTSIDE the loop (reused); `[LANES]u8` zero-init is required
-  only the first iteration — zeroed tail bytes are always masked out, so stale bytes from
-  previous iterations are also safe.
+- The placeholder is declared OUTSIDE the loop (reused). The `direct_tail_load` branch never
+  reads it; the copy branch fills exactly `nb` bytes, so `undefined` init is safe as long as
+  lanes above `nb` stay untrusted.
 
 ### 4.4 `formatString` / `formatUnquoted` wrappers
 
