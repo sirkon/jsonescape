@@ -15,6 +15,8 @@ into a single Zig module.
 ```sh
 zig build test                      # primary gate: build + run tests (Debug)
 zig fmt src/json_escape.zig         # formatting
+zig build bench                     # Zig side of the Rust-comparison benchmark (ReleaseFast)
+cargo run --release --manifest-path bench/rust/Cargo.toml   # Rust side of the same benchmark
 
 # Full verification matrix from TASK-TRANSLATE-TO-ZIG.md section 6.3.
 # --test-no-exec cross-compiles the test binary without running it.
@@ -38,9 +40,12 @@ Hardware access for verification (from the blueprint): Neon on Apple Silicon via
 ## Layout
 
 ```
-build.zig            addModule("json_escape") + test step
+build.zig            addModule("jsonescape") + test + bench steps
 build.zig.zon        package manifest (name, minimum Zig version, fingerprint)
 src/json_escape.zig  everything: backend detection, tables, kernels, public API, tests
+bench/zig/main.zig   Zig benchmark program (matched with bench/rust/src/main.rs)
+bench/rust/          Cargo project benchmarking the Rust reference crate
+bench/README.md      methodology, scenarios, and how to run both sides
 TASK-TRANSLATE-TO-ZIG.md  the original translation blueprint (spec of record)
 ```
 
@@ -55,7 +60,8 @@ Control flow: public API -> `activeBackend()` runtime dispatch -> `VectorFor(bac
 
 - `selectBackend()` picks a **comptime candidate** from `builtin.cpu`.
 - `activeBackend()` caches a **runtime** CPUID/XGETBV check (x86 only) that may downgrade the
-  candidate to `.swar`. State is a module-level `var` + bool guard, not `std.once`.
+  candidate to `.swar`. State is a module-level `var` + bool guard, not `std.once`. The probe
+  itself is the out-of-line `detectBackend`, so the hot path is a load and a branch.
 - The four tiers map to LANES: `sse2`/`neon` -> 16, `avx2` -> 32, `avx512` -> 64,
   `swar` -> `FallbackVector` (64 bytes as eight `u64` SWAR words).
 - `formatRaw` has three tiers: a 4x-wide `CHUNK` loop, a single-vector loop, and a scalar
@@ -97,6 +103,17 @@ Control flow: public API -> `activeBackend()` runtime dispatch -> `VectorFor(bac
   bit 0, matching `@ctz` used by `firstOffset`.
 - Keep the small vector/mask methods `inline fn`; that is intentional for loop fusion.
 - Public API names are camelCase (`escapeIntoUnquote`), the Rust originals being snake_case.
+- **Keep the runtime dispatch out of the kernel's entry path.** `escapeInto` /
+  `escapeIntoUnquote` compare `activeBackend()` against `selected_backend` and call
+  `formatString` / `formatUnquoted` directly; the multi-backend `switch` lives in the
+  out-of-line `escapeIntoAnyBackend*` fallbacks and the CPUID probe in the out-of-line
+  `detectBackend`. Putting the `switch` (or the CPUID code) back into `escapeInto` makes it
+  an ~9 KiB function with a 2.7 KiB stack frame that the optimizer will not inline, costing
+  an indirect jump plus a full call frame per escaped string: measured at +65% on
+  `short/realistic` and +60% on `short/every`. Do not "simplify" it back to
+  `switch (activeBackend()) { inline else => ... }`, and do not mark `formatRaw` `inline`
+  (it duplicates a 1.2 KiB kernel at every call site and trips the SWAR `inline for` branch
+  quota).
 
 ## Testing
 

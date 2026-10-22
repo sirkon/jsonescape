@@ -5,3 +5,6 @@ zig-out/
 .idea/
 .vscode/
 .zed/
+
+bench/rust/target/
+__pycache__/

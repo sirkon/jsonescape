@@ -95,12 +95,18 @@ fn runtimeSupports(comptime b: Backend) bool {
 var cached_backend: Backend = undefined;
 var backend_detected: bool = false;
 
-pub fn activeBackend() Backend {
-    if (!backend_detected) {
-        const b = comptime selected_backend;
-        cached_backend = if (runtimeSupports(b)) b else .swar;
-        backend_detected = true;
-    }
+/// Runs the CPUID/XGETBV probe. Kept out of line so `activeBackend` stays a
+/// single predictable load and branch; inlining the probe into `escapeInto`
+/// would make the dispatch too large for the optimizer to inline.
+fn detectBackend() Backend {
+    const b = comptime selected_backend;
+    cached_backend = if (runtimeSupports(b)) b else .swar;
+    backend_detected = true;
+    return cached_backend;
+}
+
+pub inline fn activeBackend() Backend {
+    if (!backend_detected) return @call(.never_inline, detectBackend, .{});
     return cached_backend;
 }
 
@@ -432,7 +438,19 @@ pub fn formatUnquoted(comptime Vec: type, value: []const u8, dst: [*]u8) [*]u8 {
 /// `+ 2` being the surrounding quotes); the extra slack absorbs full-width
 /// vector stores (up to 64 bytes) and the fixed 8-byte escape-table copies
 /// that write past the final length. There are no runtime bounds checks.
+///
+/// The hot path is deliberately split from the multi-backend fallback: a single
+/// `switch` over every backend here turns this into an ~9 KiB function that the
+/// optimizer will not inline, costing a full call frame, an indirect jump and a
+/// re-materialization of the kernel constants for every escaped string.
 pub fn escapeInto(dst: [*]u8, value: []const u8) [*]u8 {
+    if (activeBackend() == selected_backend) {
+        return formatString(VectorFor(selected_backend), value, dst);
+    }
+    return @call(.never_inline, escapeIntoAnyBackend, .{ dst, value });
+}
+
+fn escapeIntoAnyBackend(dst: [*]u8, value: []const u8) [*]u8 {
     return switch (activeBackend()) {
         inline else => |b| formatString(VectorFor(b), value, dst),
     };
@@ -441,6 +459,13 @@ pub fn escapeInto(dst: [*]u8, value: []const u8) [*]u8 {
 /// Like `escapeInto` but without the surrounding quotes. Worst case
 /// `6 * value.len` bytes; the same `value.len * 6 + 64` capacity rule applies.
 pub fn escapeIntoUnquote(dst: [*]u8, value: []const u8) [*]u8 {
+    if (activeBackend() == selected_backend) {
+        return formatUnquoted(VectorFor(selected_backend), value, dst);
+    }
+    return @call(.never_inline, escapeIntoAnyBackendUnquote, .{ dst, value });
+}
+
+fn escapeIntoAnyBackendUnquote(dst: [*]u8, value: []const u8) [*]u8 {
     return switch (activeBackend()) {
         inline else => |b| formatUnquoted(VectorFor(b), value, dst),
     };
@@ -707,6 +732,37 @@ test "dispatched public API" {
         const own_u = try escapeUnquote(std.testing.allocator, fixture);
         defer std.testing.allocator.free(own_u);
         try std.testing.expectEqualSlices(u8, expected_unquoted, own_u);
+    }
+}
+
+test "runtime fallback dispatch" {
+    // `escapeInto` only takes `escapeIntoAnyBackend` when the runtime CPU probe
+    // downgrades the compile-time backend, which never happens on a host that
+    // matches its build target. Exercise that path directly so it cannot rot.
+    const fixtures = [_][]const u8{
+        "",
+        "hello",
+        "hello\n",
+        "\"",
+        "\\",
+        "\r\n",
+        "0123456789abcdef",
+        "0123456789abcdef0123456789abcdef",
+        "Hello \"World\"!\n\tEmoji: \xF0\x9F\x98\x80 Chinese: \xE4\xB8\xAD\xE6\x96\x87",
+    };
+
+    var expected_q: [4200]u8 = undefined;
+    var expected_u: [4200]u8 = undefined;
+    var out: [4200]u8 = undefined;
+
+    for (fixtures) |fixture| {
+        const expected = expected_q[0..referenceEscape(fixture, true, &expected_q)];
+        const end_q = escapeIntoAnyBackend(&out, fixture);
+        try std.testing.expectEqualSlices(u8, expected, out[0 .. @intFromPtr(end_q) - @intFromPtr(&out)]);
+
+        const expected_unquoted = expected_u[0..referenceEscape(fixture, false, &expected_u)];
+        const end_u = escapeIntoAnyBackendUnquote(&out, fixture);
+        try std.testing.expectEqualSlices(u8, expected_unquoted, out[0 .. @intFromPtr(end_u) - @intFromPtr(&out)]);
     }
 }
 
