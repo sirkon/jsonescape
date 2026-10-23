@@ -103,19 +103,19 @@ fn buildDataset(
     return .{ .strings = strings, .total_bytes = total_bytes };
 }
 
-fn onePass(strings: []const []u8, dst: []u8) usize {
+fn onePass(comptime Api: type, strings: []const []u8, dst: []u8) usize {
     var acc: usize = 0;
     for (strings) |s| {
-        const out = json_escape.escapeIntoSlice(dst, s);
+        const out = Api.escapeIntoSlice(dst, s);
         acc +%= out.len;
     }
     return acc;
 }
 
-fn checksum(strings: []const []u8, dst: []u8) u64 {
+fn checksum(comptime Api: type, strings: []const []u8, dst: []u8) u64 {
     var h: u64 = 0xCBF2_9CE4_8422_2325;
     for (strings) |s| {
-        const out = json_escape.escapeIntoSlice(dst, s);
+        const out = Api.escapeIntoSlice(dst, s);
         for (out) |b| {
             h ^= b;
             h *%= 0x0000_0100_0000_01B3;
@@ -128,8 +128,8 @@ fn nowNs(io: std.Io) u64 {
     return @intCast(std.Io.Clock.awake.now(io).nanoseconds);
 }
 
-fn measure(io: std.Io, strings: []const []u8, dst: []u8) u64 {
-    std.mem.doNotOptimizeAway(onePass(strings, dst));
+fn measure(comptime Api: type, io: std.Io, strings: []const []u8, dst: []u8) u64 {
+    std.mem.doNotOptimizeAway(onePass(Api, strings, dst));
 
     var reps: u64 = 1;
     var elapsed: u64 = 0;
@@ -137,7 +137,7 @@ fn measure(io: std.Io, strings: []const []u8, dst: []u8) u64 {
         const start = nowNs(io);
         var i: u64 = 0;
         while (i < reps) : (i += 1) {
-            std.mem.doNotOptimizeAway(onePass(strings, dst));
+            std.mem.doNotOptimizeAway(onePass(Api, strings, dst));
         }
         elapsed = nowNs(io) - start;
         if (elapsed >= min_sample_ns) break;
@@ -150,7 +150,7 @@ fn measure(io: std.Io, strings: []const []u8, dst: []u8) u64 {
         const start = nowNs(io);
         var i: u64 = 0;
         while (i < reps) : (i += 1) {
-            std.mem.doNotOptimizeAway(onePass(strings, dst));
+            std.mem.doNotOptimizeAway(onePass(Api, strings, dst));
         }
         const ns = (nowNs(io) - start) / reps;
         if (ns < best) best = ns;
@@ -159,14 +159,15 @@ fn measure(io: std.Io, strings: []const []u8, dst: []u8) u64 {
 }
 
 fn report(
+    comptime Api: type,
     io: std.Io,
     stdout: *std.Io.Writer,
     name: []const u8,
     dataset: Dataset,
     dst: []u8,
 ) !void {
-    const chk = checksum(dataset.strings, dst);
-    const best_ns = measure(io, dataset.strings, dst);
+    const chk = checksum(Api, dataset.strings, dst);
+    const best_ns = measure(Api, io, dataset.strings, dst);
     const ps_per_byte = best_ns * 1000 / dataset.total_bytes;
     const mib_per_s = @as(f64, @floatFromInt(dataset.total_bytes)) *
         1_000_000_000.0 /
@@ -177,16 +178,16 @@ fn report(
     );
 }
 
-pub fn main(init: std.process.Init) !void {
-    const allocator = init.arena.allocator();
-    var stdout_buffer: [4096]u8 = undefined;
-    var stdout_writer = std.Io.File.stdout().writer(init.io, &stdout_buffer);
-    const stdout = &stdout_writer.interface;
-
+fn runAll(
+    comptime Api: type,
+    io: std.Io,
+    stdout: *std.Io.Writer,
+    allocator: std.mem.Allocator,
+) !void {
     var dst_buffer: [dst_capacity]u8 = undefined;
     const dst = dst_buffer[0..];
 
-    try stdout.print("{s}\n", .{"json_escape benchmark"});
+    try stdout.print("json_escape benchmark\n", .{});
     try stdout.print(
         "{s:<16} {s:>7} {s:>10} {s:>12} {s:>8} {s:>10} {s:>18}\n",
         .{ "name", "strings", "bytes", "ns/pass", "ps/byte", "MiB/s", "checksum" },
@@ -201,9 +202,18 @@ pub fn main(init: std.process.Init) !void {
             var rng = Rng.init(seedFor(bucket_index, workload + 1));
             const dataset = try buildDataset(allocator, lengths, &rng, workload == 0);
             const name = try std.fmt.bufPrint(&name_buffer, "{s}/{s}", .{ bucket.name, label });
-            try report(init.io, stdout, name, dataset, dst);
+            try report(Api, io, stdout, name, dataset, dst);
         }
     }
 
     try stdout.flush();
+}
+
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.arena.allocator();
+    var stdout_buffer: [4096]u8 = undefined;
+    var stdout_writer = std.Io.File.stdout().writer(init.io, &stdout_buffer);
+    const stdout = &stdout_writer.interface;
+
+    try runAll(json_escape, init.io, stdout, allocator);
 }

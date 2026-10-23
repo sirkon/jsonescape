@@ -209,18 +209,6 @@ pub fn EscapeMask(comptime LANES: usize) type {
             return if (comptime nibble) trailing >> 2 else trailing;
         }
 
-        /// Keeps the low `n` lanes and clears everything above them.
-        pub inline fn keepLanes(self: Self, n: usize) Self {
-            const drop = LANES - n;
-            if (comptime nibble) {
-                if (drop == 0) return self;
-                const shift: u6 = @intCast(drop * 4);
-                return .{ .bits = (self.bits << shift) >> shift };
-            }
-            const all_ones: Bits = std.math.maxInt(Bits);
-            return .{ .bits = self.bits & (all_ones >> @intCast(drop)) };
-        }
-
         pub inline fn fromPredicate(pred: @Vector(LANES, bool)) Self {
             if (comptime nibble) {
                 const V = @Vector(LANES, u8);
@@ -401,6 +389,9 @@ inline fn checkCrossPage(ptr: [*]const u8, step: usize) bool {
 // Part 4: main kernel
 // ---------------------------------------------------------------------------
 
+/// Escape the raw payload into `dst`, returning a cursor one past the last
+/// written byte. Exposed for tests and custom kernels; shares the
+/// `value.len * 6 + 64` capacity contract with the public API.
 pub fn formatRaw(comptime Vec: type, value: []const u8, dst: [*]u8) [*]u8 {
     const LANES = Vec.lanes;
     const CHUNK = LANES * 4;
@@ -409,37 +400,28 @@ pub fn formatRaw(comptime Vec: type, value: []const u8, dst: [*]u8) [*]u8 {
     var dptr: [*]u8 = dst;
     var nb: usize = value.len;
 
-    // Tier 1: CHUNK loop.
+    // Tier 1: CHUNK loop. Vectors are loaded and tested one at a time: on
+    // escape-dense input the first escape almost always lands in the first
+    // vector, so computing all four predicates up front (the old `hotMask4`
+    // call) made every iteration pay for three vectors that were immediately
+    // discarded by the `continue`. Escape-free input still gets the four
+    // stores back to back; it only adds three well-predicted tests per CHUNK.
     chunk: while (nb >= CHUNK) {
-        const v1 = Vec.loadu(sptr);
-        const v2 = Vec.loadu(sptr + LANES);
-        const v3 = Vec.loadu(sptr + LANES * 2);
-        const v4 = Vec.loadu(sptr + LANES * 3);
-
-        if (Vec.hotMask4(v1, v2, v3, v4).isZero()) {
-            v1.storeu(dptr);
-            v2.storeu(dptr + LANES);
-            v3.storeu(dptr + LANES * 2);
-            v4.storeu(dptr + LANES * 3);
-            nb -= CHUNK;
-            dptr += CHUNK;
-            sptr += CHUNK;
-        } else {
-            inline for (.{ v1, v2, v3, v4 }) |v| {
-                v.storeu(dptr);
-                const m = v.hotMask();
-                if (!m.isZero()) {
-                    const cn = m.firstOffset();
-                    nb -= cn;
-                    dptr += cn;
-                    sptr += cn;
-                    escapeUnchecked(&sptr, &nb, &dptr);
-                    continue :chunk;
-                }
-                nb -= LANES;
-                dptr += LANES;
-                sptr += LANES;
+        inline for (0..4) |_| {
+            const v = Vec.loadu(sptr);
+            const m = v.hotMask();
+            v.storeu(dptr);
+            if (!m.isZero()) {
+                const cn = m.firstOffset();
+                nb -= cn;
+                dptr += cn;
+                sptr += cn;
+                escapeUnchecked(&sptr, &nb, &dptr);
+                continue :chunk;
             }
+            nb -= LANES;
+            dptr += LANES;
+            sptr += LANES;
         }
     }
 
@@ -479,11 +461,9 @@ pub fn formatRaw(comptime Vec: type, value: []const u8, dst: [*]u8) [*]u8 {
         v.storeu(dptr);
         // Lanes past `nb` may hold over-read bytes, but they can only move the
         // first escape at or beyond `nb`, so a first offset >= nb means the
-        // valid range is clean. The NEON nibble mask uses that directly (the
-        // mask shift would cost more than the compare); the one-bit-per-lane
-        // masks are cheaper to clear, which keeps `@ctz` off the branch.
-        const m = if (comptime Vec.HotMask.nibble) v.hotMask() else v.hotMask().keepLanes(nb);
-        const cn = m.firstOffset();
+        // valid range is clean. Read the raw mask on every backend; masking the
+        // over-read lanes first is pure overhead.
+        const cn = v.hotMask().firstOffset();
         if (cn >= nb) {
             dptr += nb;
             break :tail;
@@ -497,6 +477,7 @@ pub fn formatRaw(comptime Vec: type, value: []const u8, dst: [*]u8) [*]u8 {
     return dptr;
 }
 
+/// Escape `value` into `dst` as a quoted JSON string.
 pub fn formatString(comptime Vec: type, value: []const u8, dst: [*]u8) [*]u8 {
     var d = dst;
     d[0] = '"';
@@ -506,6 +487,8 @@ pub fn formatString(comptime Vec: type, value: []const u8, dst: [*]u8) [*]u8 {
     return end + 1;
 }
 
+/// Escape the raw payload into `dst`, available under its own name for
+/// callers that prefer symmetry with `formatString`.
 pub fn formatUnquoted(comptime Vec: type, value: []const u8, dst: [*]u8) [*]u8 {
     return formatRaw(Vec, value, dst);
 }
@@ -513,6 +496,15 @@ pub fn formatUnquoted(comptime Vec: type, value: []const u8, dst: [*]u8) [*]u8 {
 // ---------------------------------------------------------------------------
 // Part 5: public API
 // ---------------------------------------------------------------------------
+
+fn shrink(allocator: std.mem.Allocator, buf: []u8, cnt: usize) std.mem.Allocator.Error![]u8 {
+    if (cnt == buf.len) return buf;
+    const shrunk = allocator.realloc(buf, cnt) catch |err| {
+        allocator.free(buf);
+        return err;
+    };
+    return shrunk;
+}
 
 /// Escape `value` into `dst` as a quoted JSON string.
 /// Returns a pointer to the first byte after the last written element; the
@@ -532,10 +524,10 @@ pub fn escapeInto(dst: [*]u8, value: []const u8) [*]u8 {
     if (activeBackend() == selected_backend) {
         return formatString(VectorFor(selected_backend), value, dst);
     }
-    return @call(.never_inline, escapeIntoAnyBackend, .{ dst, value });
+    return @call(.never_inline, anyBackendString, .{ dst, value });
 }
 
-fn escapeIntoAnyBackend(dst: [*]u8, value: []const u8) [*]u8 {
+fn anyBackendString(dst: [*]u8, value: []const u8) [*]u8 {
     return switch (activeBackend()) {
         inline else => |b| formatString(VectorFor(b), value, dst),
     };
@@ -547,10 +539,10 @@ pub fn escapeIntoUnquote(dst: [*]u8, value: []const u8) [*]u8 {
     if (activeBackend() == selected_backend) {
         return formatUnquoted(VectorFor(selected_backend), value, dst);
     }
-    return @call(.never_inline, escapeIntoAnyBackendUnquote, .{ dst, value });
+    return @call(.never_inline, anyBackendUnquote, .{ dst, value });
 }
 
-fn escapeIntoAnyBackendUnquote(dst: [*]u8, value: []const u8) [*]u8 {
+fn anyBackendUnquote(dst: [*]u8, value: []const u8) [*]u8 {
     return switch (activeBackend()) {
         inline else => |b| formatUnquoted(VectorFor(b), value, dst),
     };
@@ -573,15 +565,6 @@ pub fn escapeIntoUnquoteSlice(dst: []u8, value: []const u8) []u8 {
     }
     const end = escapeIntoUnquote(dst.ptr, value);
     return dst[0 .. @intFromPtr(end) - @intFromPtr(dst.ptr)];
-}
-
-fn shrink(allocator: std.mem.Allocator, buf: []u8, cnt: usize) std.mem.Allocator.Error![]u8 {
-    if (cnt == buf.len) return buf;
-    const shrunk = allocator.realloc(buf, cnt) catch |err| {
-        allocator.free(buf);
-        return err;
-    };
-    return shrunk;
 }
 
 pub fn escape(allocator: std.mem.Allocator, value: []const u8) std.mem.Allocator.Error![]u8 {
@@ -847,9 +830,10 @@ test "dispatched public API" {
 }
 
 test "runtime fallback dispatch" {
-    // `escapeInto` only takes `escapeIntoAnyBackend` when the runtime CPU probe
-    // downgrades the compile-time backend, which never happens on a host that
-    // matches its build target. Exercise that path directly so it cannot rot.
+    // The public API only takes its any-backend fallback when the runtime CPU
+    // probe downgrades the compile-time backend, which never happens on a host
+    // that matches its build target. Exercise that path directly so it cannot
+    // rot.
     const fixtures = [_][]const u8{
         "",
         "hello",
@@ -868,11 +852,11 @@ test "runtime fallback dispatch" {
 
     for (fixtures) |fixture| {
         const expected = expected_q[0..referenceEscape(fixture, true, &expected_q)];
-        const end_q = escapeIntoAnyBackend(&out, fixture);
+        const end_q = anyBackendString(&out, fixture);
         try std.testing.expectEqualSlices(u8, expected, out[0 .. @intFromPtr(end_q) - @intFromPtr(&out)]);
 
         const expected_unquoted = expected_u[0..referenceEscape(fixture, false, &expected_u)];
-        const end_u = escapeIntoAnyBackendUnquote(&out, fixture);
+        const end_u = anyBackendUnquote(&out, fixture);
         try std.testing.expectEqualSlices(u8, expected_unquoted, out[0 .. @intFromPtr(end_u) - @intFromPtr(&out)]);
     }
 }

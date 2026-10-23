@@ -1,104 +1,156 @@
-# json_escape public API
+# AGENTS.md
 
-`json_escape` is a single-module Zig 0.17 library (`build.zig` declares an
-`addModule("json_escape", ...)` rooted at `src/json_escape.zig`). Import it as:
+SIMD-accelerated JSON string escaping, translated from the Rust `json-escape-simd` crate
+into a single Zig module.
 
-```zig
-const json_escape = @import("json_escape");
+## Toolchain
+
+- **Zig 0.17.0** is required (`build.zig.zon` sets `minimum_zig_version = "0.17.0"`; the
+  installed `zig` is 0.17.0). Many APIs used here differ from older Zig the model may have
+  seen: `std.once` does not exist, `std.Target.current` does not exist, and
+  `Cpu.features.isEnabled(.enum_tag)` is wrong (use `cpu.has(.x86, .avx2)`).
+
+## Commands
+
+```sh
+zig build test                      # primary gate: build + run tests (Debug)
+zig fmt src/json_escape.zig         # formatting
+zig build bench                     # Zig side of the benchmark (ReleaseFast)
+cargo run --release --manifest-path bench/rust/Cargo.toml   # Rust side of the same benchmark
+
+# Full verification matrix from TASK-TRANSLATE-TO-ZIG.md section 6.3.
+# --test-no-exec cross-compiles the test binary without running it.
+zig test src/json_escape.zig
+zig test src/json_escape.zig -O ReleaseSafe
+zig test src/json_escape.zig -O ReleaseFast
+zig test src/json_escape.zig -target aarch64-linux --test-no-exec
+zig test src/json_escape.zig -target aarch64-macos -mcpu=apple_m1 --test-no-exec
+zig test src/json_escape.zig -target x86_64-linux -mcpu=baseline --test-no-exec
+zig test src/json_escape.zig -target x86_64-windows --test-no-exec
+zig test src/json_escape.zig -target riscv64-linux --test-no-exec   # SWAR-only tier
 ```
 
-It produces JSON escaped bytes: bytes `< 0x20` become `\u00xx` (or the short forms
-`\b \t \n \f \r`), `"` becomes `\"`, and `\` becomes `\\`. Every other byte, including
-`0x20` and all bytes `>= 0x7F`, is copied verbatim. Input is `[]const u8` and is never
-UTF-8 validated; invalid UTF-8 passes through unchanged.
+The tail-loop safety logic branches on `builtin.os.tag` and `builtin.mode`, so the same
+source must compile and pass under **all three optimization modes and every target above**.
+A change that only passes Debug or only the host is not done.
 
-Internal development guidance (toolchain, architecture, testing) lives in
-`AGENTS-DEV.md`.
+Hardware access for verification (from the blueprint): Neon on Apple Silicon via
+`ssh homembp`; AVX-512 via the Intel SDE (`sde -icl -- ./test/binary`).
 
-## Intended consumer API
+## Layout
 
-Only the `escape*` family is meant for callers. Everything else marked `pub` is exposed
-for tests and custom kernels (see "Exposed internals" below).
-
-| Function | Output | Fallible | Buffer |
-|---|---|---|---|
-| `escape(allocator, value) ![]u8` | quoted | yes | allocates |
-| `escapeUnquote(allocator, value) ![]u8` | unquoted | yes | allocates |
-| `escapeInto(dst: [*]u8, value) [*]u8` | quoted | no | caller |
-| `escapeIntoUnquote(dst: [*]u8, value) [*]u8` | unquoted | no | caller |
-| `escapeIntoSlice(dst: []u8, value) []u8` | quoted | no | caller |
-| `escapeIntoUnquoteSlice(dst: []u8, value) []u8` | unquoted | no | caller |
-
-Quoted output includes the surrounding `"` characters; unquoted output is the escaped
-payload only. Both forms are returned as exactly the written bytes (the `*Slice` and
-allocator variants) or as a cursor (the raw `[*]u8` variants).
-
-## Usage examples
-
-Allocating, the simplest entry point:
-
-```zig
-const std = @import("std");
-const json_escape = @import("json_escape");
-
-const allocator = std.heap.page_allocator;
-const escaped = try json_escape.escape(allocator, "tab\there\n");
-defer allocator.free(escaped);
-// escaped == "\"tab\\there\\n\"" (including the surrounding quotes)
+```
+build.zig            addModule("jsonescape") + test + bench steps
+build.zig.zon        package manifest (name, minimum Zig version, fingerprint)
+src/json_escape.zig  everything: backend detection, tables, kernels, public API, tests
+bench/zig/main.zig   Zig benchmark program (matched with bench/rust/src/main.rs)
+bench/rust/          Cargo project benchmarking the Rust reference crate
+bench/README.md      methodology, scenarios, and how to run both sides
+TASK-TRANSLATE-TO-ZIG.md  the original translation blueprint (spec of record)
 ```
 
-Caller-provided buffer, slice API:
+The Rust source of truth lives outside this repo at `~/Sources/mine/json-escape-simd-x`.
+`TASK-TRANSLATE-TO-ZIG.md` contains verified, known-good snippets; prefer them verbatim
+when extending the translation. Deviations require justification.
 
-```zig
-var buf: [128]u8 = undefined;
-const out = json_escape.escapeIntoSlice(&buf, "tab\there\n");
-// out is buf[0..n], exactly the written bytes; out == "\"tab\\there\\n\""
+## Architecture
 
-const raw = json_escape.escapeIntoUnquoteSlice(&buf, "a\nb");
-// raw == "a\\nb" (no surrounding quotes)
-```
+Control flow: public API -> `activeBackend()` runtime dispatch -> `VectorFor(backend)`
+-> `formatRaw` generic kernel -> per-backend vector type.
 
-Raw cursor API, when the written length is tracked manually:
+- The public `escape*` functions call the shared `activeBackend()` dispatch directly;
+  there is no namespace or kernel-variant layer.
+- `selectBackend()` picks a **comptime candidate** from `builtin.cpu`.
+- `activeBackend()` caches a **runtime** CPUID/XGETBV check (x86 only) that may downgrade the
+  candidate to `.swar`. State is a module-level `var` + bool guard, not `std.once`. The probe
+  itself is the out-of-line `detectBackend`, so the hot path is a load and a branch. On
+  non-x86 targets the guard is compile-time-eliminated and `activeBackend()` folds to
+  `selected_backend` (the `switch` on `builtin.cpu.arch` must stay so this keeps working).
+- The four tiers map to LANES: `sse2`/`neon` -> 16, `avx2` -> 32, `avx512` -> 64,
+  `swar` -> `FallbackVector` (64 bytes as eight `u64` SWAR words).
+- `formatRaw` has three tiers: a 4x-wide `CHUNK` loop, a single-vector loop, and a
+  scalar tail. Only the tail may over-read, and only under a strict gate (linux/macos +
+  ReleaseFast/ReleaseSmall + same 4 KiB page). See section 4.3 of the blueprint.
+- Rust needed five per-arch backends because of `#[target_feature]`; Zig's
+  `@Vector(N, u8)` lowers per compile target instead, so there is exactly one generic
+  pipeline. Do not recreate the per-arch files.
+- `EscapeMask(LANES)` is the kernel-internal escape mask. It is one bit per lane except on
+  aarch64/16 lanes, where it stores the NEON nibble layout (4 bits per lane, one `shrn` to
+  extract, `firstOffset` = `@ctz >> 2`). LLVM lowers `@bitCast(@Vector(16, bool))` to
+  `and/ext/zip1/addv`, which cost the port 10-30% vs the Rust crate on M1; the nibble mask
+  is the same trick as Rust's `NeonBits`. `escapedMask()`/`Mask.bitmask()` keep the portable
+  one-bit-per-lane contract for tests and callers. Do not collapse the two.
+- Tier 1 loads and tests the four chunk vectors one at a time so an early escape does not
+  pay for the other three predicates. `Vec.hotMask4` remains exposed and tested but is not
+  used by the kernel.
 
-```zig
-var buf: [128]u8 = undefined;
-const end = json_escape.escapeInto(&buf, "a\nb");
-const written = buf[0 .. @intFromPtr(end) - @intFromPtr(&buf)];
-// written == "\"a\\nb\""
-```
+## Public API contract (important gotchas)
 
-## Gotchas
+- `escapeInto(dst, value)` / `escapeIntoUnquote` write through raw `[*]u8` cursors and
+  return a pointer to the **first byte after the last written byte**. They perform no bounds
+  checks. Callers must provide `value.len * 6 + 64` bytes: `6 * value.len + 2` is the logical
+  worst case, and the `+64` absorbs full-width vector stores and the fixed 8-byte escape-table
+  copies that write past the logical end. Do not "tighten" this bound to `6*len+2`.
+- `escape` / `escapeUnquote` (allocator wrappers) are the only fallible functions; they
+  allocate `6*len+64`, then `realloc` down to the written length (freeing on failure).
+- `escapeIntoSlice` / `escapeIntoUnquoteSlice` panic in Debug/ReleaseSafe if capacity is
+  insufficient; that check is comptime-eliminated in release modes.
+- Input is `[]const u8` and is never UTF-8 validated: escaping preserves bytes, so invalid
+  UTF-8 passes through unchanged.
+- Escape set is exactly bytes `< 0x20` (short forms `\b \t \n \f \r`, else `\u00xx`),
+  `"`, and `\`. `0x20` and all bytes `>= 0x7F` are copied verbatim.
 
-- **Destination capacity is `value.len * 6 + 64`, always.** `6 * value.len + 2` is the
-  logical worst case; the extra 64 bytes absorb full-width vector stores and the fixed
-  8-byte escape-table copies that write past the logical end. Do not pass a tighter
-  buffer, and do not "optimize" this bound. There are no bounds checks in the raw
-  `[*]u8` functions.
-- `escapeInto*Slice` panics with "destination buffer too small" only in **Debug and
-  ReleaseSafe**. The check is comptime-eliminated in ReleaseFast/ReleaseSmall, where an
-  undersized buffer is undefined behavior.
-- `escapeInto` / `escapeIntoUnquote` return a pointer to the **first byte after** the
-  last written byte, not a length. Convert with
-  `buf[0..@intFromPtr(end) - @intFromPtr(buf.ptr)]`. They never fail.
-- `escape` / `escapeUnquote` are the only fallible functions
-  (`std.mem.Allocator.Error![]u8`). They allocate `6*len+64` and `realloc` down to the
-  written length; on shrink failure they free the buffer and return the error. Free the
-  result with the same allocator.
-- Empty input yields a 2-byte quoted result (`""`) or a 0-byte unquoted result.
-- The allocator variants take `(allocator, value)` in that order.
+## Conventions and Zig-specific patterns
 
-## Exposed internals
+- **Tables are comptime-generated**, never hand-written: `quoteTab` and `needEscaped` are
+  `blk: { ... }` blocks. `needEscaped[i]` must stay derived from `quoteTab[i].len != 0`.
+- Escape payloads are always NUL-padded `[8]u8` and the slow path copies all 8 bytes; `len`
+  is the true length (2 or 6; 0 means copy verbatim). Do not shrink this to `len`.
+- **Unaligned vector access** is `@as(*align(1) const @Vector(LANES, u8), @ptrCast(ptr)).*`
+  and the symmetric store. The `align(1)` is mandatory; omitting it inherits the vector's
+  natural alignment and is UB on unaligned input.
+- No implicit integer casts. Shift counts must be the operand's shift type; a runtime
+  shift needs an explicitly typed left operand (a `comptime_int` cannot be shifted by a
+  runtime amount).
+- `escapedMask` semantics: bit `i` of the result is 1 iff byte `i` needs escaping. Lane 0 is
+  bit 0, matching `@ctz` used by `EscapeMask.firstOffset`. The `EscapeMask` nibble layout
+  keeps the same `firstOffset` contract; only `bits` is arch-specific.
+- The tail loop rejects a first offset `>= nb` instead of masking lanes past `nb`. It
+  reads the raw first offset on every backend; over-read lanes can only report offsets
+  `>= nb`, so masking them away is pure overhead.
+- Keep the small vector/mask methods `inline fn`; that is intentional for loop fusion.
+- Public API names are camelCase (`escapeIntoUnquote`), the Rust originals being snake_case.
+- **Keep the runtime dispatch out of the kernel's entry path.** The top-level
+  `escapeInto` / `escapeIntoUnquote` compare `activeBackend()` against `selected_backend`
+  and call `formatString` / `formatUnquoted` directly; the multi-backend `switch`
+  lives in the out-of-line `anyBackendString` / `anyBackendUnquote` fallbacks and the
+  CPUID probe in the out-of-line `detectBackend`. Putting the `switch` (or the CPUID code)
+  back into `escapeInto` makes it an ~9 KiB function with a 2.7 KiB stack frame that the
+  optimizer will not inline, costing an indirect jump plus a full call frame per escaped
+  string: measured at +65% on `short/realistic` and +60% on `short/every`. Do not
+  "simplify" it back to `switch (activeBackend()) { inline else => ... }`, and do not mark
+  `formatRaw` `inline` (it duplicates a 1.2 KiB kernel at every call site and trips the
+  SWAR `inline for` branch
+  quota).
 
-These are `pub` so tests and custom kernels can use them; treat them as unstable.
+## Testing
 
-- `Backend` (`sse2`, `neon`, `avx2`, `avx512`, `swar`), `selectBackend()` (comptime
-  candidate from `builtin.cpu`), `selected_backend`, and `activeBackend()` (cached
-  runtime CPUID check that may downgrade to `.swar`).
-- `VectorFor(backend)` maps a backend to its vector type; `Mask(LANES)`,
-  `SimdVector(LANES)`, and `FallbackVector` are the backend implementations, each
-  offering `loadu`, `storeu`, and `escapedMask`, plus `hotMask`/`hotMask4` returning the
-  kernel-internal `EscapeMask(LANES)` (one bit per lane, except the aarch64 nibble layout).
-- `EscapeEntry`, `quoteTab: [256]EscapeEntry`, and `needEscaped: [256]u8`.
-- `formatRaw(Vec, value, dst)`, `formatString(Vec, value, dst)`, and
-  `formatUnquoted(Vec, value, dst)` are the per-backend kernels behind the dispatched
-  API; they share the same `6*len+64` capacity contract.
+- Tests are inline `test "..."` blocks at the bottom of `src/json_escape.zig`.
+- The oracle is `referenceEscape`, a scalar port of the table walk (Zig std has no JSON
+  escaper). New cases should be compared against it.
+- **Every backend must be exercised explicitly** via
+  `const all_backends = .{ SimdVector(16), SimdVector(32), SimdVector(64), FallbackVector };`
+  and an `inline for` loop. Testing only the dispatched path silently skips AVX-512 on
+  most hosts. `expectMatchesOracle` already does this for both quoted and unquoted
+  output.
+- The SWAR mask must always agree bit-for-bit with the 64-lane vector mask.
+- Random coverage is a 3-shift xorshift64 with a per-length seed over sizes `0..=300`
+  (covers 15/16, 31/32, 63/64, 127/128, 255/256 boundaries); unaligned starts are covered by
+  300-byte windows at offsets `0..=32`. Stack buffers of `[4200]u8` are the established size.
+- `std.testing.allocator` is used for the allocating API, so leaks are caught automatically.
+
+## Repo notes
+
+- `.gitignore` covers `.zig-cache/`, `zig-out/`, `*.o`, and editor dirs. A stray
+  `json_escape.o` may appear in the repo root from manual `zig build-obj` runs; it is ignored.
+- The default branch is `master`. Do not commit unless asked.

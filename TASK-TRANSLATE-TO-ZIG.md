@@ -416,11 +416,11 @@ inline fn clearHighBits(m: anytype, n: usize) @TypeOf(m) {
 - `n` must be runtime-`usize`; the `all_ones` materialization + `@intCast` is the ONLY
   correct shift form (ground rule 0.1.2).
 
-**Update: both helpers moved into `EscapeMask(LANES)`** (`firstOffset`, `keepLanes`,
-`isZero`, `orWith`, `fromPredicate`). `keepLanes(n)` replaces
-`clearHighBits(mask, LANES - n)`. The free functions were removed so the kernel has exactly
-one mask abstraction; the tail loop additionally skips the masking entirely on aarch64 (see
-4.3), where `firstOffset()` alone decides whether the valid range is clean.
+**Update: the helpers now live in `EscapeMask(LANES)`** (`firstOffset`, `isZero`, `orWith`,
+`fromPredicate`). The free functions were removed so the kernel has exactly one mask
+abstraction. The old `keepLanes(n)` helper (which replaced
+`clearHighBits(mask, LANES - n)`) was removed with the masked-tail kernel: the tail loop now
+reads the raw first offset on every backend (see 4.3).
 
 ### 2.3 Scalar fallback: `FallbackVector` (SWAR over `[8]u64`, LANES = 64) — verified
 
@@ -681,12 +681,11 @@ runtime page check:
 
 **Update (Apple Silicon, measured).** The loop above is the historical shape. The current
 kernel declares `placeholder` as `undefined` (Debug/ReleaseSafe fill exactly `nb` bytes before
-the load; lanes above `nb` are never trusted) and uses the mask helpers directly:
+the load; lanes above `nb` are never trusted) and reads the raw mask:
 
 ```zig
         v.storeu(dptr);
-        const m = if (comptime Vec.HotMask.nibble) v.hotMask() else v.hotMask().keepLanes(nb);
-        const cn = m.firstOffset();
+        const cn = v.hotMask().firstOffset();
         if (cn >= nb) {
             dptr += nb;
             break :tail;
@@ -697,11 +696,10 @@ the load; lanes above `nb` are never trusted) and uses the mask helpers directly
         escapeUnchecked(&sptr, &nb, &dptr);
 ```
 
-Why: on NEON the nibble mask is cheap to read but costs two shifts to clear, and `@ctz` already
-returns `LANES` for an empty mask, so comparing the first offset against `nb` is enough — the
-over-read lanes can only move the first escape at or beyond `nb`. On x86 clearing the mask is a
-single `bzhi`/`and`, and keeping `@ctz` off the branch dependency chain measures ~3% faster on
-`short/every`, so those masks still take the mask-then-test route.
+Why: `@ctz` already returns `LANES` for an empty mask, and over-read lanes can only move the
+first escape at or beyond `nb`, so comparing the first offset against `nb` is enough on every
+backend. Clearing the over-read lanes first only measured faster on one large-string
+workload, not enough to keep a second kernel.
 
 The exact cfg matrix (translating `#[cfg(...)]` in `avx2.rs:245-268`):
 
@@ -727,7 +725,7 @@ inline fn checkCrossPage(ptr: [*]const u8, step: usize) bool {
 Tail-loop invariants to preserve verbatim:
 - Store the full vector even though only `nb` bytes are meaningful — the capacity contract
   (Part 5) guarantees `LANES` writable bytes at `dptr`. Lanes at index >= `nb` must never
-  trigger an escape: either clear them (`keepLanes`) or reject a first offset >= `nb`.
+  trigger an escape: reject a first offset >= `nb`.
 - No escape in the valid range → advance `dptr += nb` (not LANES!) and `break :tail`.
 - Otherwise `cn` from the mask, advance by `cn`, `escapeUnchecked`, loop. The loop
   re-runs only while `nb > 0`; `escapeUnchecked` can bring `nb` to 0, ending the loop.
