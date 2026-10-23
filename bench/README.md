@@ -49,8 +49,10 @@ Both implementations perform the same steps:
 
 1. **Dataset generation** (once, outside timing): for each bucket a vector of
    lengths is drawn from a seeded xorshift64\* PRNG, then each string is filled
-   byte by byte from the same PRNG stream. Content is printable ASCII
-   (`0x20..=0x7E`). For strings that must need escaping, every PRNG draw with
+   byte by byte from the same PRNG stream. Plain content is drawn from the
+   printable ASCII range (`0x20..=0x7E`) minus `"` and `\` (93 bytes), so a
+   string that is not marked as needing escaping contains nothing that must be
+   escaped. For strings that must need escaping, every PRNG draw with
    `r % 8 == 0` is replaced by a byte from the escape set
    (`\"`, `\\`, `\n`, `\t`, `\r`, `0x08`, `0x0C`, `0x01`), and one extra
    escape byte is forced at a derived position so the guarantee is exact.
@@ -89,13 +91,17 @@ differs.
 1. **`every` -- everything needs escapes**: 100% of strings contain at least one
    byte that must be escaped, with roughly 1 in 8 bytes escaped. This exercises
    the SIMD fast path and the scalar escape path on every string.
-2. **`realistic` -- realistic workload**: 95% of strings are pure printable
-   ASCII and need no escaping at all (the fully vectorized copy path); 5% of
-   strings need escaping and are generated exactly as in the `every` workload.
+2. **`realistic` -- realistic workload**: 95% of strings contain no byte that
+   needs escaping at all (the fully vectorized copy path); 5% of strings need
+   escaping and are generated exactly as in the `every` workload. The plain
+   alphabet deliberately omits `"` and `\`: drawing from all of `0x20..=0x7E`
+   puts one of those two bytes in about 2% of positions, which makes essentially
+   every long string need escaping and turns this row into a sparse-escape
+   benchmark that never reaches the copy path.
 
 ## Reference results
 
-Intel Core i7-12700K (AVX2, no AVX-512), Linux, `powersave` governor, best of 10
+Intel Core i7-12700K (AVX2, no AVX-512), Linux, `powersave` governor, best of 5
 alternated runs of each binary. Absolute numbers vary with frequency and load;
 the ratio columns are the meaningful ones, and the checksums never change. The
 Rust side is the upstream `json-escape-simd` 3.1.2 crate from crates.io with its
@@ -105,12 +111,35 @@ default features (the crate's optional `avx512` feature is not enabled).
 
 ```
 name             strings      bytes  zig ns/pass  rust ns/pass  zig MiB/s  rust MiB/s  zig/rust
-short/every         4096      70510        55030         93225    1221.94      721.30     1.694
-short/realistic     4096      70510        13451         24557    4999.15     2738.27     1.826
-mid/every           2048     164490        89516        138368    1752.42     1133.72     1.546
-mid/realistic       2048     164490        16323         21486    9610.36     7301.03     1.316
-large/every          512     290628       185140        205126    1497.05     1351.19     1.108
-large/realistic      512     290628        39275         37849    7057.02     7322.90     0.964
+short/every         4096      70510        50083         85361    1342.64      787.76     1.704
+short/realistic     4096      70510         8863         17685    7587.00     3802.29     1.995
+mid/every           2048     164490        75553        119650    2076.29     1311.07     1.584
+mid/realistic       2048     164490         9478         13586   16550.95    11546.44     1.433
+large/every          512     290628       165648        175784    1673.21     1576.73     1.061
+large/realistic      512     290628        12329         13362   22480.69    20742.74     1.084
+
+zig/rust > 1.0 means the Zig port is faster (fewer ns per pass).
+checksums: all 6 scenarios match
+```
+
+### Before the plain-alphabet fix (historical)
+
+Measured with the same binaries but the old generator, which drew plain content
+from all of `0x20..=0x7E` and therefore put `"` or `\` in about 2% of bytes.
+That made `large/realistic` a sparse-escape workload (510 of 512 "clean" strings
+still needed escaping) rather than the copy path it is meant to measure. Kept
+so the change in the `realistic` rows can be read as what it is: a change in
+workload, not a change in the kernels -- the Zig and Rust sources under test are
+identical across both tables.
+
+```
+name             strings      bytes  zig ns/pass  rust ns/pass  zig MiB/s  rust MiB/s  zig/rust
+short/every         4096      70510        54948         92355    1223.77      728.10     1.681
+short/realistic     4096      70510        13448         24469    5000.27     2748.11     1.820
+mid/every           2048     164490        89735        138009    1748.15     1136.66     1.538
+mid/realistic       2048     164490        16153         21826    9711.50     7187.29     1.351
+large/every          512     290628       185789        205283    1491.82     1350.16     1.105
+large/realistic      512     290628        39395         37957    7035.52     7302.06     0.963
 
 zig/rust > 1.0 means the Zig port is faster (fewer ns per pass).
 checksums: all 6 scenarios match
@@ -148,15 +177,19 @@ the crate, so do not diff it directly against the current table above: the
 difference mixes the tail change with upstream improvements.
 
 The short-input buckets, where a call frame dominates the work, remain the
-port's strongest result: `short/realistic` is about 1.8x and `mid/realistic`
-about 1.3x faster than upstream Rust. This comes from keeping the runtime backend
+port's strongest result: `short/realistic` is about 2.0x and `mid/realistic`
+about 1.4x faster than upstream Rust. This comes from keeping the runtime backend
 check small enough that the compiler inlines the dispatch into the caller's
 loop; the Rust crate cannot do the same because `#[target_feature]` forces an
 out-of-line call per string.
 
-The one workload where the port is slower against upstream is `large/realistic`
-(0.96x on this machine, 0.88x on the M1 below): long strings that almost never
-need escaping are the case where upstream's kernel is already at peak bandwidth.
+Long escape-free strings (`large/realistic`) now run at about 22 GiB/s on both
+sides, with the port ahead by roughly 8%: with no escapes the inner loop is a
+check-and-copy, and the two kernels issue the same AVX2 sequence. The one shape
+where upstream still matches or slightly beats this port is *sparse* escapes --
+long strings with one escapable byte every few dozen bytes -- where each escape
+restarts the chunk loop. No scenario above covers that shape, so measure it
+directly before optimizing for it.
 
 > User input:
 >
@@ -167,7 +200,11 @@ need escaping are the case where upstream's kernel is already at peak bandwidth.
 
 
 
-### Apple M1 (NEON), macOS
+### Apple M1 (NEON), macOS (historical)
+
+Measured before the plain-alphabet fix, so these datasets are not the ones the
+current generators produce (in particular `large/realistic` was a sparse-escape
+row, not a copy-path row). Re-measure before quoting it.
 
 Best of 10 alternated runs of each binary, upstream `json-escape-simd` 3.1.2 as
 the Rust side. Absolute numbers move with frequency and background load; the

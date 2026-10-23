@@ -13,9 +13,19 @@ const min_sample_ns: u64 = 250 * std.time.ns_per_ms;
 const samples: u64 = 7;
 const max_len: usize = 1024;
 const dst_capacity: usize = max_len * 6 + 64;
-const printable: u64 = 95;
+
+/// Printable ASCII (`0x20..=0x7E`) minus `"` and `\`, so a byte drawn from
+/// this alphabet never needs escaping.
+const plain_alphabet: u64 = 93;
 
 const escapable = [8]u8{ '"', '\\', '\n', '\t', '\r', 0x08, 0x0C, 0x01 };
+
+/// Map an index in `0..plain_alphabet` onto that alphabet: printable ASCII
+/// with `0x22` and `0x5C` skipped.
+fn plainByte(index: u64) u8 {
+    const i: u8 = @intCast(index);
+    return 0x20 + i + @as(u8, @intFromBool(i >= 0x02)) + @as(u8, @intFromBool(i >= 0x3B));
+}
 
 const Bucket = struct {
     name: []const u8,
@@ -62,8 +72,8 @@ fn genContent(allocator: std.mem.Allocator, rng: *Rng, len: usize, needs_escape:
         const r = rng.next();
         const escaped = needs_escape and r % 8 == 0;
         const payload = @as(usize, @intCast((r >> 8) % escapable.len));
-        const plain = @as(u8, @intCast(r % printable));
-        b.* = if (escaped) escapable[payload] else 0x20 + plain;
+        const plain = plainByte(r % plain_alphabet);
+        b.* = if (escaped) escapable[payload] else plain;
     }
     if (needs_escape) {
         const idx: usize = @intCast(rng.below(len));

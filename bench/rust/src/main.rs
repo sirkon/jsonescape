@@ -15,9 +15,19 @@ const MIN_SAMPLE: Duration = Duration::from_millis(250);
 const SAMPLES: u64 = 7;
 const MAX_LEN: usize = 1024;
 const DST_CAPACITY: usize = MAX_LEN * 6 + 64;
-const PRINTABLE: u64 = 95;
+
+/// Printable ASCII (`0x20..=0x7E`) minus `"` and `\`, so a byte drawn from
+/// this alphabet never needs escaping.
+const PLAIN_ALPHABET: u64 = 93;
 
 const ESCAPABLE: [u8; 8] = [b'"', b'\\', b'\n', b'\t', b'\r', 0x08, 0x0C, 0x01];
+
+/// Map an index in `0..PLAIN_ALPHABET` onto that alphabet: printable ASCII
+/// with `0x22` and `0x5C` skipped.
+fn plain_byte(index: u64) -> u8 {
+    let i = index as u8;
+    0x20 + i + u8::from(i >= 0x02) + u8::from(i >= 0x3b)
+}
 
 struct Bucket {
     name: &'static str,
@@ -83,8 +93,8 @@ fn gen_content(rng: &mut Rng, len: usize, needs_escape: bool) -> Vec<u8> {
         let r = rng.next();
         let escaped = needs_escape && r % 8 == 0;
         let payload = ((r >> 8) % ESCAPABLE.len() as u64) as usize;
-        let plain = (r % PRINTABLE) as u8;
-        *b = if escaped { ESCAPABLE[payload] } else { 0x20 + plain };
+        let plain = plain_byte(r % PLAIN_ALPHABET);
+        *b = if escaped { ESCAPABLE[payload] } else { plain };
     }
     if needs_escape {
         let idx = rng.below(len as u64) as usize;
