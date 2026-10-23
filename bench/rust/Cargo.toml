@@ -4,10 +4,9 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 
-# The Rust reference implementation is expected next to the Zig port.
-# Override with a `[patch]` or by editing the path if it lives elsewhere.
+# The original upstream crate (napi-rs/json-escape-simd), pulled from crates.io.
 [dependencies]
-json-escape-simd = { path = "../../../json-escape-simd-x" }
+json-escape-simd = "3.1.2"
 
 [[bin]]
 name = "json-escape-bench"
